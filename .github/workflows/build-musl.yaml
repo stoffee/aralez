@@ -1,0 +1,65 @@
+# Build the static x86_64 musl binary the lab's Nomad job consumes, and — because
+# there is no local Rust toolchain to cargo-check against — this workflow doubles
+# as the compile check. A red run here is the fail-closed signal that a source fix
+# did not build; nothing ships until it is green.
+#
+# The lab job (nomad-jobs/aralez/aralez.nomad.hcl in hashistack-home-lab) fetches
+# `aralez-x86_64-musl.gz` by sha256. On a tag push this publishes that exact asset
+# to a GitHub release; the deploy step is then: update the job's artifact source +
+# checksum to the new release and re-run it.
+#
+# ⚠️ pingora is built here with the `openssl` feature against musl. That combo is
+# the known-fiddly part (openssl-sys static linking under musl). If the link step
+# fails, the fix is usually musl-tools + a vendored/static openssl, iterated against
+# THIS run's logs — do not assume the recipe below is right until it goes green once.
+name: build-musl
+
+on:
+  push:
+    branches: [ "fix/**", "main" ]
+  workflow_dispatch: {}
+  release:
+    types: [ created ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build (release, musl)
+        env:
+          # Static OpenSSL under musl. If the crate graph honours a vendored
+          # openssl this builds self-contained; if it does not, this run fails
+          # loudly and tells us the real recipe.
+          OPENSSL_STATIC: "1"
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/aralez
+          file "$BIN"
+          gzip -c "$BIN" > aralez-x86_64-musl.gz
+          sha256sum aralez-x86_64-musl.gz | tee aralez-x86_64-musl.gz.sha256
+
+      - name: Upload build artifact (every run — for testing before a release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aralez-x86_64-musl
+          path: |
+            aralez-x86_64-musl.gz
+            aralez-x86_64-musl.gz.sha256
+
+      - name: Attach to release (tag pushes only)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            aralez-x86_64-musl.gz
+            aralez-x86_64-musl.gz.sha256
