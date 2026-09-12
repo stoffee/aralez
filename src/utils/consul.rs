@@ -1,7 +1,8 @@
 use crate::utils::httpclient;
 use crate::utils::kuberconsul::{list_to_upstreams, ServiceDiscovery};
 use crate::utils::parceyaml::build_headers;
-use crate::utils::structs::{Configuration, GlobalServiceMapping, UpstreamsDashMap};
+use crate::utils::structs::{Configuration, GlobalServiceMapping, InnerMap, UpstreamsDashMap};
+use std::sync::atomic::AtomicUsize;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use pingora::prelude::sleep;
@@ -76,7 +77,31 @@ impl ServiceDiscovery for ConsulDiscovery {
                         };
 
                         let list = httpclient::for_consul(pref.as_str(), consul.token.clone(), gsm).await;
-                        list_to_upstreams(list, &upstreams, gsm);
+                        if list.is_some() {
+                            list_to_upstreams(list, &upstreams, gsm);
+                        } else {
+                            // FIX (stoffee fork, 2026-09-12): a FAILED per-service Consul
+                            // fetch is NOT evidence the service is gone. The authoritative
+                            // presence signal is the tag-filtered service LIST above, and
+                            // this host is still in it. Upstream aralez silently omits the
+                            // host when the fetch returns None (list_to_upstreams has no
+                            // else branch) — indistinguishable from a genuine removal — so a
+                            // transient read failure (5s timeout, stale pooled connection)
+                            // drops a live host, and the compare-only-on-change loop then
+                            // latches that omission until the process is restarted.
+                            // Observed on crypto.stoffee.io: 90+ min of 502 after a backend
+                            // redeploy, zero populate events, route restored only by a bounce.
+                            // Retain this host's last-known upstreams instead of dropping it.
+                            let key: Arc<str> = Arc::from(gsm.hostname.as_str());
+                            if let Some(prev) = config.upstreams.get(&key) {
+                                let retained: DashMap<Arc<str>, (Vec<Arc<InnerMap>>, AtomicUsize)> = DashMap::new();
+                                for e in prev.value().iter() {
+                                    let (servers, _idx) = e.value();
+                                    retained.insert(e.key().clone(), (servers.clone(), AtomicUsize::new(0)));
+                                }
+                                upstreams.insert(key, retained);
+                            }
+                        }
                     }
                 }
             }
