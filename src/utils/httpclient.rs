@@ -166,58 +166,81 @@ pub async fn getfromapi(url: &str, token: Option<String>, provider: &str) -> Opt
         peer.options.alpn = ALPN::H2H1;
     }
 
-    let mut http_session = CONNECTOR.get_http_session(&peer).await.ok()?;
-    let mut req = RequestHeader::build("GET", path.as_bytes(), None).ok()?;
-
     let host_header = if (is_tls && port == 443) || (!is_tls && port == 80) {
         host.to_string()
     } else {
         format!("{}:{}", host, port)
     };
-    req.insert_header("Host", host_header).ok()?;
-    req.insert_header("Accept", "application/json").ok()?;
 
-    match provider {
-        "consul" => {
-            if let Some(token) = token {
-                req.insert_header("X-Consul-Token", token).ok()?;
+    // D63 poisoned-keepalive fix (stoffee fork, 2026-09-24): on a TRANSPORT error
+    // (connect / write / read-header) the pooled connection is broken or
+    // half-consumed. The old code released it back into the keepalive pool, so
+    // every later 5s poll could pull that same dead connection, getfromapi kept
+    // returning None, and a backend that had REAPPEARED in Consul (e.g. penelope
+    // after an allocation replacement onto a new node) was never re-added — the
+    // route latched 502 until a manual bounce. Fix: on any transport error DROP
+    // the session (never release it to the pool, so it is closed) and retry with
+    // a fresh one; only release connections that carried a complete HTTP response.
+    for attempt in 0..3u8 {
+        let mut http_session = match CONNECTOR.get_http_session(&peer).await {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("API connect failed for {} (attempt {}): {}", url, attempt + 1, e);
+                continue; // nothing to drop; retry
+            }
+        };
+
+        let mut req = RequestHeader::build("GET", path.as_bytes(), None).ok()?;
+        req.insert_header("Host", host_header.clone()).ok()?;
+        req.insert_header("Accept", "application/json").ok()?;
+        match provider {
+            "consul" => {
+                if let Some(token) = &token {
+                    req.insert_header("X-Consul-Token", token.clone()).ok()?;
+                }
+            }
+            "kubernetes" => {
+                if let Some(token) = &token {
+                    req.insert_header("Authorization", format!("Bearer {}", token)).ok()?;
+                }
+            }
+            _ => {}
+        }
+
+        if let Err(e) = http_session.0.write_request_header(Box::new(req)).await {
+            log::warn!("API write header failed for {} (attempt {}): {} — dropping pooled conn", url, attempt + 1, e);
+            continue; // drop broken session (NOT released to pool), retry fresh
+        }
+
+        let status = match http_session.0.read_response_header().await {
+            Ok(_) => http_session.0.response_header().map(|r| r.status.as_u16()).unwrap_or(500),
+            Err(e) => {
+                log::warn!("API read header failed for {} (attempt {}): {} — dropping pooled conn", url, attempt + 1, e);
+                continue; // drop broken session (NOT released to pool), retry fresh
+            }
+        };
+
+        let mut body_bytes = Vec::new();
+        if status == 200 {
+            while let Ok(Some(chunk)) = http_session.0.read_response_body().await {
+                body_bytes.extend_from_slice(&chunk);
             }
         }
-        "kubernetes" => {
-            if let Some(token) = token {
-                req.insert_header("Authorization", format!("Bearer {}", token)).ok()?;
-            }
-        }
-        _ => {}
-    }
 
-    if http_session.0.write_request_header(Box::new(req)).await.is_err() {
+        // Complete HTTP response received: the connection is healthy, return it to
+        // the keepalive pool. A clean non-200 is authoritative (not a transport
+        // failure), so it is returned as None without a retry.
         CONNECTOR.release_http_session(http_session.0, &peer, None).await;
-        return None;
+
+        return if status == 200 && !body_bytes.is_empty() {
+            Some(body_bytes)
+        } else {
+            None
+        };
     }
 
-    let status = match http_session.0.read_response_header().await {
-        Ok(_) => http_session.0.response_header().map(|r| r.status.as_u16()).unwrap_or(500),
-        Err(e) => {
-            log::warn!("API call failed to read response header for {}: {}", url, e);
-            500
-        }
-    };
-
-    let mut body_bytes = Vec::new();
-    if status == 200 {
-        while let Ok(Some(chunk)) = http_session.0.read_response_body().await {
-            body_bytes.extend_from_slice(&chunk);
-        }
-    }
-
-    CONNECTOR.release_http_session(http_session.0, &peer, None).await;
-
-    if status == 200 && !body_bytes.is_empty() {
-        Some(body_bytes)
-    } else {
-        None
-    }
+    log::warn!("API call to {} failed after retries (all transport attempts errored)", url);
+    None
 }
 
 fn parse_url(url: &str) -> Result<(&str, u16, &str, bool), &'static str> {
