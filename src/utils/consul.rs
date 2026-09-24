@@ -26,6 +26,17 @@ pub struct ConsulDiscovery;
 impl ServiceDiscovery for ConsulDiscovery {
     async fn fetch_upstreams(&self, config: Arc<Configuration>, toreturn: Sender<Configuration>) {
         loop {
+            // D63 watchdog (stoffee fork, 2026-09-24): bound the ENTIRE discovery
+            // iteration so the loop can never freeze. The route-loss latch was a
+            // FROZEN loop — populate events stopped and never resumed after a backend
+            // moved node — i.e. an await in this body (a poisoned-keepalive Consul
+            // read, or a blocked channel send) hung forever, so a backend that had
+            // reappeared in Consul was never re-added. pingora's own per-peer timeouts
+            // did not catch it. A hung iteration is abandoned here (its futures and
+            // pooled sessions dropped) and the next 5s poll starts fresh. The warn!
+            // below is intentional: a passing acceptance test should SHOW the watchdog
+            // rescuing a hung poll, not leave the pass unexplained.
+            let iteration = async {
             let upstreams = UpstreamsDashMap::new();
 
             if let Some(consul) = config.consul.clone() {
@@ -108,6 +119,13 @@ impl ServiceDiscovery for ConsulDiscovery {
 
             if let Some(lt) = crate::utils::kuberconsul::clone_compare(&upstreams, &config).await {
                 let _ = toreturn.send(lt).await;
+            }
+            };
+
+            if tokio::time::timeout(Duration::from_secs(20), iteration).await.is_err() {
+                log::warn!(
+                    "consul discovery iteration exceeded the 20s watchdog — abandoning it and retrying next cycle (D63 freeze guard fired)"
+                );
             }
 
             sleep(Duration::from_secs(5)).await;
